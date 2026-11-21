@@ -4,20 +4,34 @@ import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from hashlib import sha256
+from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
 from pathlib import Path
 import subprocess
 from threading import Thread
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, quote_plus, urlsplit
 from uuid import uuid4
 
 from selenium.common.exceptions import WebDriverException
 
-from puma.apps.android.firefox.firefox import Firefox
+from puma.apps.android.firefox.firefox import Firefox, FIREFOX_PACKAGE
 from puma.apps.android.firefox import xpaths as xp
 from puma.state_graph.state import State
+
+DETERMINISTIC_CASES = (
+    'visit', 'search_fixture', 'bookmark', 'tabs', 'private', 'download',
+    'history', 'settings', 'collection', 'recovery', 'panel_recovery',
+)
+ALL_CASES = (*DETERMINISTIC_CASES, 'search')
+
+
+class _UtcIsoFormatter(logging.Formatter):
+    """Format log timestamps in unambiguous UTC ISO-8601 format."""
+
+    def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
+        return datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(timespec='milliseconds')
 
 
 def _pdf(label: str) -> bytes:
@@ -51,20 +65,32 @@ def _adb(device: str, *arguments: str) -> str:
 
 
 @contextmanager
-def _fixture(device: str, run_id: str):
+def _local_http_fixture(run_id: str):
+    """Serve deterministic synthetic HTML pages, a local query fixture, and a known PDF on loopback."""
     filename = f'PUMA-Firefox-{run_id}-06.pdf'
     pdf = _pdf(f'PUMA Firefox {run_id} 06 controlled PDF')
     titles = {key: f'PUMA {run_id} {key}' for key in ('01-visit', '03-bookmark', '04-tab', '05-private')}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            path = urlsplit(self.path).path
+            parsed = urlsplit(self.path)
+            path = parsed.path
             if path == f'/{run_id}/{filename}':
                 content_type, body = 'application/pdf', pdf
+            elif path == f'/{run_id}/02-search-fixture':
+                query = parse_qs(parsed.query).get('q', [''])[0]
+                title = f'PUMA Fixture Search: {query}'
+                safe_title = escape(title)
+                content_type = 'text/html; charset=utf-8'
+                body = (
+                    f'<!doctype html><html><title>{safe_title}</title>'
+                    f'<h1>{safe_title}</h1><p>Deterministic local query fixture</p></html>'
+                ).encode()
             elif path.startswith(f'/{run_id}/') and (key := path.rsplit('/', 1)[-1]) in titles:
                 title = titles[key]
+                safe_title = escape(title)
                 content_type = 'text/html; charset=utf-8'
-                body = f'<!doctype html><html><title>{title}</title><h1>{title}</h1></html>'.encode()
+                body = f'<!doctype html><html><title>{safe_title}</title><h1>{safe_title}</h1></html>'.encode()
             else:
                 self.send_error(404)
                 return
@@ -78,16 +104,24 @@ def _fixture(device: str, run_id: str):
             pass
 
     with ThreadingHTTPServer(('127.0.0.1', 0), Handler) as server:
-        port = f'tcp:{server.server_port}'
-        _adb(device, 'reverse', '--no-rebind', port, port)
         worker = Thread(target=server.serve_forever, daemon=True)
         worker.start()
         try:
             base = f'http://127.0.0.1:{server.server_port}/{run_id}'
-            yield base, titles, filename, sha256(pdf).hexdigest()
+            yield server.server_port, base, titles, filename, sha256(pdf).hexdigest()
         finally:
             server.shutdown()
             worker.join()
+
+
+@contextmanager
+def _fixture(device: str, run_id: str):
+    with _local_http_fixture(run_id) as (server_port, base, titles, filename, digest):
+        port = f'tcp:{server_port}'
+        _adb(device, 'reverse', '--no-rebind', port, port)
+        try:
+            yield base, titles, filename, digest
+        finally:
             _adb(device, 'reverse', '--remove', port)
 
 
@@ -106,8 +140,25 @@ def _capture(app: Firefox, output: Path, name: str) -> None:
         app.gtl_logger.info('Android restricted the screenshot for %s. The UI XML was retained.', name)
 
 
-def _run(app: Firefox, device: str, run_id: str, output: Path, selected: list[str] | None) -> dict:
+def _write_report(output: Path, metadata: dict, results: dict) -> None:
+    payload = {'metadata': metadata, 'scenarios': results}
+    (output / 'results.json').write_text(json.dumps(payload, indent=2), encoding='utf-8')
+
+
+def _run(
+    app: Firefox,
+    device: str,
+    run_id: str,
+    output: Path,
+    selected: list[str] | None,
+    include_external_search: bool,
+    metadata: dict,
+) -> dict:
     results = {}
+    active_cases = list(selected) if selected else list(DETERMINISTIC_CASES)
+    if include_external_search and 'search' not in active_cases:
+        active_cases.append('search')
+
     with _fixture(device, run_id) as (base, titles, filename, digest):
         visit_url = f'{base}/01-visit'
         bookmark_url = f'{base}/03-bookmark'
@@ -116,36 +167,52 @@ def _run(app: Firefox, device: str, run_id: str, output: Path, selected: list[st
         app.open_tab()
 
         def visit() -> str:
-            address = app.visit_url(visit_url, verify_with=lambda: app.is_page_title(titles['01-visit']))
+            address = app.visit_url(
+                visit_url,
+                expected_title=titles['01-visit'],
+                verify_with=lambda: app.is_page_title(titles['01-visit']),
+            )
             _require(app.is_page_title(titles['01-visit']), 'Controlled title did not load')
             _require(visit_url.removeprefix('http://') in address, f'Unexpected address {address!r}')
             _capture(app, output, '01_browser')
             return address
 
-        def search() -> str:
+        def search_fixture() -> str:
+            query = f'PUMA Firefox {run_id} 02 deterministic query'
+            query_url = f'{base}/02-search-fixture?q={quote_plus(query)}'
+            expected_title = f'PUMA Fixture Search: {query}'
+            address = app.visit_url(query_url, expected_title=expected_title)
+            _require(app.is_page_title(expected_title), 'Deterministic local query fixture title did not load')
+            _capture(app, output, '02_search_fixture')
+            return f'{address} ({expected_title})'
+
+        def search() -> dict:
             query = f'PUMA Firefox {run_id} 02 synthetic search'
             address = app.search(query)
             expected_title = f'{query} - Google Search'
-            _require(app.is_page_title(expected_title), 'Google did not show the exact synthetic query in its title')
-            _capture(app, output, '02_search')
-            return f'{address} ({expected_title})'
+            title_matched = app.is_page_title(expected_title, timeout=8)
+            _capture(app, output, '02_search_external')
+            return {
+                'external_dependency': True,
+                'observed_address': address,
+                'google_title_matched': title_matched,
+                'outcome': 'observed' if title_matched else 'inconclusive_external_engine',
+            }
 
         def bookmark() -> str:
-            app.visit_url(bookmark_url)
-            _require(app.is_page_title(titles['03-bookmark']), 'Bookmark target did not load')
+            app.visit_url(bookmark_url, expected_title=titles['03-bookmark'])
             _require(app.add_bookmark(), 'Firefox did not offer Add bookmark')
             _require(app.has_bookmark(bookmark_url), 'Exact synthetic bookmark did not appear')
             _capture(app, output, '03_bookmarks')
             _require(app.delete_bookmark(bookmark_url), 'Exact synthetic bookmark did not offer Delete')
             _require(not app.has_bookmark(bookmark_url), 'Synthetic bookmark remained visible')
-            return 'Created, observed and removed the exact synthetic URL'
+            return 'Created, observed and removed the exact synthetic URL (UI observation)'
 
         def tabs() -> str:
             app.open_tab()
-            app.visit_url(tab_url)
-            _require(app.is_page_title(titles['04-tab']), 'Normal tab target did not load')
+            app.visit_url(tab_url, expected_title=titles['04-tab'])
             app.open_tab()
-            app.visit_url(visit_url)
+            app.visit_url(visit_url, expected_title=titles['01-visit'])
             _require(titles['04-tab'] in app.inspect_tabs(), 'Synthetic normal tab was absent')
             _capture(app, output, '04_tabs')
             _require(app.switch_tab(titles['04-tab']), 'Synthetic normal tab was not uniquely visible')
@@ -159,9 +226,8 @@ def _run(app: Firefox, device: str, run_id: str, output: Path, selected: list[st
 
         def private() -> str:
             app.open_tab(private=True)
-            address = app.visit_url_private(private_url)
+            address = app.visit_url_private(private_url, expected_title=titles['05-private'])
             _require(private_url.removeprefix('http://') in address, f'Unexpected private address {address!r}')
-            _require(app.is_page_title(titles['05-private']), 'Private tab target did not load')
             _capture(app, output, '05_private_browser')
             _require(titles['05-private'] in app.inspect_tabs(private=True), 'Private title missing in private tray')
             _capture(app, output, '05_private_tabs')
@@ -170,7 +236,7 @@ def _run(app: Firefox, device: str, run_id: str, output: Path, selected: list[st
             _require(titles['05-private'] not in app.inspect_tabs(private=True), 'Closed private tab still visible')
             rows = app.inspect_history()
             _require(all(row['url'] != private_url for row in rows), 'Private URL was visible in normal History')
-            return 'Opened, switched and closed a private tab. Its URL was absent from visible normal History.'
+            return 'Opened, switched and closed a private tab; URL absent from visible normal History viewport'
 
         def download() -> dict:
             app.download_pdf(f'{base}/{filename}')
@@ -183,15 +249,14 @@ def _run(app: Firefox, device: str, run_id: str, output: Path, selected: list[st
             return {'filename': filename, 'expected_sha256': digest, 'observed_sha256': observed}
 
         def history() -> str:
-            app.visit_url(visit_url)
-            _require(app.is_page_title(titles['01-visit']), 'History target did not load')
+            app.visit_url(visit_url, expected_title=titles['01-visit'])
             rows = app.inspect_history()
             _capture(app, output, '07_history')
             _require(any(row['url'] == visit_url and row['title'] == titles['01-visit'] for row in rows),
                      'Exact visit title and URL were absent from visible History')
-            return 'Matching title and URL observed in normal History'
+            return 'Matching title and URL observed in visible normal History'
 
-        def settings() -> str:
+        def settings() -> dict:
             normal = app.inspect_settings()
             _capture(app, output, '08_settings')
             privacy = app.inspect_privacy_settings()
@@ -205,29 +270,28 @@ def _run(app: Firefox, device: str, run_id: str, output: Path, selected: list[st
                      'Tracking Protection settings were absent')
             _require(any(row['title'] == 'Autoplay' for row in site), 'Site permissions were absent')
             _require(any(row['title'] == 'List' for row in tab), 'Tab layout settings were absent')
-            app.visit_url(visit_url)
+            app.visit_url(visit_url, expected_title=titles['01-visit'])
             info = app.inspect_site_info()
             _require('127.0.0.1' in info.get('url', ''), f'Wrong site panel {info!r}')
-            return 'Read settings, site permissions, tab layout and the current site panel'
+            return {'site_info': info, 'summary': 'Read settings, site permissions, tab layout and site panel'}
 
         def collection() -> str:
             name = f'PUMA Firefox {run_id} 09 collection'
-            app.visit_url(visit_url)
-            _require(app.is_page_title(titles['01-visit']), 'Collection target did not load')
+            app.visit_url(visit_url, expected_title=titles['01-visit'])
             saved = app.save_to_new_collection(name)
             _capture(app, output, '09_collection_save')
+            # Explicitly open a Firefox Home tab before read-only collection inspection.
+            app.open_tab()
             _require(app.has_collection(name), f'Collection absent from Home (save acknowledgement={saved})')
             _capture(app, output, '09_collection_home')
-            return f'Saved the page and observed the collection {name!r} on the homepage'
+            return f'Saved page, explicitly opened Home tab, and observed collection {name!r} on Home'
 
         def recovery() -> str:
             app.go_to_state(Firefox.tabs_state)
             tray_overlays = (
                 ('tab_menu', xp.TABS_MENU, Firefox.tabs_menu_state),
-                ('groups', "//*[@clickable='true' and contains(@content-desc, 'tab groups open.')]",
-                 Firefox.groups_state),
-                ('sync', "//*[@clickable='true' and starts-with(@content-desc, 'Synchronised Tabs Open:')]",
-                 Firefox.synced_tabs_state),
+                ('groups', xp.TABS_SELECT_GROUPS, Firefox.groups_state),
+                ('sync', xp.TABS_SELECT_SYNCED, Firefox.synced_tabs_state),
             )
             for name, entry, state in tray_overlays:
                 app.driver.click(entry)
@@ -254,8 +318,7 @@ def _run(app: Firefox, device: str, run_id: str, output: Path, selected: list[st
             app.go_to_state(Firefox.menu_state)
             return_from('private_menu', Firefox.menu_state, Firefox.browser_state)
 
-            app.visit_url(bookmark_url)
-            _require(app.is_page_title(titles['03-bookmark']), 'Panel test page did not load')
+            app.visit_url(bookmark_url, expected_title=titles['03-bookmark'])
             app.driver.click(xp.BROWSER_SITE_INFO)
             return_from('site_info', Firefox.site_info_state, Firefox.browser_state)
 
@@ -272,19 +335,32 @@ def _run(app: Firefox, device: str, run_id: str, output: Path, selected: list[st
             _require(not app.has_bookmark(bookmark_url), 'Synthetic panel test bookmark remained visible')
 
             app.go_to_state(Firefox.settings_state)
-            delete_data_row = "//*[@resource-id='android:id/title' and @text='Delete browsing data']"
-            app.driver.swipe_to_click_element(delete_data_row, max_swipes=5)
+            app.driver.swipe_to_click_element(xp.SETTINGS_DELETE_DATA, max_swipes=5)
             return_from('delete_data_view_only', Firefox.delete_data_state, Firefox.settings_state)
             return 'Recovered from the private menu, site panel, collection picker, bookmark menu and data panel'
 
-        cases = {'visit': visit, 'search': search, 'bookmark': bookmark, 'tabs': tabs,
-                 'private': private, 'download': download, 'history': history, 'settings': settings,
-                 'collection': collection, 'recovery': recovery, 'panel_recovery': panel_recovery}
-        for name, scenario in cases.items():
-            if selected and name not in selected:
-                continue
+        cases = {
+            'visit': visit,
+            'search_fixture': search_fixture,
+            'search': search,
+            'bookmark': bookmark,
+            'tabs': tabs,
+            'private': private,
+            'download': download,
+            'history': history,
+            'settings': settings,
+            'collection': collection,
+            'recovery': recovery,
+            'panel_recovery': panel_recovery,
+        }
+        for name in active_cases:
+            scenario = cases[name]
             try:
-                results[name] = {'status': 'passed', 'observed': scenario()}
+                observed = scenario()
+                status = 'passed'
+                if isinstance(observed, dict) and observed.get('outcome') == 'inconclusive_external_engine':
+                    status = 'inconclusive'
+                results[name] = {'status': status, 'observed': observed}
             except Exception as error:
                 results[name] = {'status': 'failed', 'error': str(error).replace(device, '<device>')}
                 try:
@@ -292,27 +368,38 @@ def _run(app: Firefox, device: str, run_id: str, output: Path, selected: list[st
                 except Exception as capture_error:
                     results[name]['capture_error'] = str(capture_error).replace(device, '<device>')
             print(f'{name}: {results[name]}', flush=True)
-            (output / 'results.json').write_text(json.dumps(results, indent=2), encoding='utf-8')
+            _write_report(output, metadata, results)
     return results
 
 
-def main() -> int:
-    """Run the selected live scenarios and return 1 if any scenario fails."""
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--device', required=True, help='ADB serial for the dedicated test phone')
     parser.add_argument('--appium-server', default='http://127.0.0.1:4723')
     parser.add_argument('--output', type=Path, required=True, help='Directory for UI captures and results')
-    parser.add_argument('--case', action='append',
-                        choices=('visit', 'search', 'bookmark', 'tabs', 'private', 'download', 'history', 'settings',
-                                 'collection', 'recovery', 'panel_recovery'))
-    args = parser.parse_args()
+    parser.add_argument('--case', action='append', choices=ALL_CASES)
+    parser.add_argument(
+        '--include-external-search',
+        action='store_true',
+        help='Also run the optional external default search-engine scenario (non-deterministic network dependency)',
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the selected live scenarios and return 1 if any scenario fails."""
+    parser = _build_parser()
+    args = parser.parse_args(argv)
     repository = Path(__file__).resolve().parents[1]
     if args.output.resolve().is_relative_to(repository):
         parser.error('Store device captures and logs outside the source checkout')
     locale = _adb(args.device, 'shell', 'getprop', 'persist.sys.locale')
     if not locale.startswith('en'):
         parser.error(f'Expected an English Android locale, found {locale!r}')
-    run_id = datetime.now(timezone.utc).strftime('%m%d%H%M') + '-' + uuid4().hex[:4]
+    android_release = _adb(args.device, 'shell', 'getprop', 'ro.build.version.release')
+    android_sdk = _adb(args.device, 'shell', 'getprop', 'ro.build.version.sdk')
+    started_utc = datetime.now(timezone.utc)
+    run_id = started_utc.strftime('%m%d%H%M') + '-' + uuid4().hex[:4]
     output = args.output.resolve() / run_id
     output.mkdir(parents=True)
     print(f'Firefox verification output: {output}', flush=True)
@@ -326,11 +413,28 @@ def main() -> int:
         version = app.driver.get_app_version()
         _require(version == Firefox.supported_version,
                  f'Expected Firefox {Firefox.supported_version}, found {version}')
+        metadata = {
+            'run_id': run_id,
+            'started_utc': started_utc.isoformat(timespec='milliseconds'),
+            'app_package': FIREFOX_PACKAGE,
+            'supported_version': Firefox.supported_version,
+            'observed_app_version': version,
+            'android_release': android_release,
+            'android_sdk': android_sdk,
+            'locale': locale,
+            'include_external_search': bool(args.include_external_search or (args.case and 'search' in args.case)),
+            'evidence_scope': (
+                'UI observations and public Downloads SHA-256 verification only; '
+                'Firefox profile databases require separate forensic acquisition.'
+            ),
+        }
         handler = logging.FileHandler(output / 'firefox_gtl.log', encoding='utf-8')
-        handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+        handler.setFormatter(_UtcIsoFormatter('%(asctime)s [%(levelname)s] %(message)s'))
         app.gtl_logger.addHandler(handler)
         try:
-            results = _run(app, args.device, run_id, output, args.case)
+            results = _run(
+                app, args.device, run_id, output, args.case, args.include_external_search, metadata,
+            )
         finally:
             app.gtl_logger.removeHandler(handler)
             handler.close()
